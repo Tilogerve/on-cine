@@ -169,11 +169,46 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-async function searchCinemas() {
-  if (!currentPos?.lat || !currentPos?.lon) {
-    setStatus("먼저 '내 위치로' 버튼을 눌러주세요.");
-    return;
+async function postOverpass(query) {
+  const endpoints = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.nchc.org.tw/api/interpreter"
+  ];
+
+  let lastErr = null;
+
+  for (const url of endpoints) {
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 12000);
+
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+        body: "data=" + encodeURIComponent(query),
+        signal: controller.signal
+      });
+
+      clearTimeout(t);
+
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+    }
   }
+
+  throw lastErr || new Error("Overpass 요청 실패");
+}
+
+
+async function searchCinemas() {
+
+  if (!currentPos?.lat || !currentPos?.lon) {
+  setStatus("먼저 '내 위치로' 버튼을 눌러주세요.");
+  return;
+}
 
   const radius = parseInt(document.getElementById("radius").value, 10);
 
@@ -181,16 +216,44 @@ async function searchCinemas() {
   listEl.innerHTML = "";
   cinemaLayer.clearLayers();
 
-  const url = `/api/cinemas?lat=${currentPos.lat}&lon=${currentPos.lon}&radius=${radius}`;
+  // Overpass QL: cinema(amenity=cinema) + name around current position
+  const query = `
+[out:json][timeout:15];
+(
+  node["amenity"="cinema"](around:${radius},${currentPos.lat},${currentPos.lon});
+  way["amenity"="cinema"](around:${radius},${currentPos.lat},${currentPos.lon});
+  relation["amenity"="cinema"](around:${radius},${currentPos.lat},${currentPos.lon});
+);
+out tags center;
+`.trim();
+
 
   try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      const errData = await response.json();
-      throw new Error(errData.error || "서버 응답 오류");
-    }
-    
-    const items = await response.json();
+    const data = await postOverpass(query);
+
+    const items = (data.elements || [])
+      .map((el) => {
+        const lat = el.lat ?? el.center?.lat;
+        const lon = el.lon ?? el.center?.lon;
+        if (typeof lat !== "number" || typeof lon !== "number") return null;
+
+        const name = el.tags?.name || "이름 없음";
+        const addr =
+          el.tags?.["addr:full"] ||
+          [el.tags?.["addr:city"], el.tags?.["addr:district"], el.tags?.["addr:street"], el.tags?.["addr:housenumber"]]
+            .filter(Boolean)
+            .join(" ") ||
+          el.tags?.["addr:street"] ||
+          "";
+
+        const dist = haversineMeters(currentPos.lat, currentPos.lon, lat, lon);
+        const osmUrl = `https://www.openstreetmap.org/${el.type}/${el.id}`;
+        const naviUrl = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}`;
+
+        return { name, addr, lat, lon, dist, osmUrl, naviUrl };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.dist - b.dist);
 
     if (items.length === 0) {
       const filtersEl = document.getElementById("filters");
